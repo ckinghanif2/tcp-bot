@@ -1,4 +1,5 @@
 import requests , os , psutil , sys , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp
+from flask import Flask, request, jsonify
 from protobuf_decoder.protobuf_decoder import Parser
 from xC4 import * ; from xHeaders import *
 from datetime import datetime
@@ -26,6 +27,13 @@ loop_task = None
 loop_active = False
 evoloop_task = None
 evoloop_active = False
+# Flask / Bot integration globals
+aio_loop = None                # the asyncio event loop running the bot
+BOT_KEY = None                 # set once MaiiiinE retrieves it
+BOT_IV = None
+BOT_TARGET_UID = None
+BOT_READY = False              # set True once bot is connected and ready to accept commands
+RECENT_LOGS = []
 #------------------------------------------#
 
 Hr = {
@@ -862,6 +870,18 @@ async def MaiiiinE():
     key = MajoRLoGinauTh.key
     iv = MajoRLoGinauTh.iv
     timestamp = MajoRLoGinauTh.timestamp
+    # Publish important values to globals so the Flask API can use them
+    try:
+        global BOT_KEY, BOT_IV, BOT_TARGET_UID, BOT_READY, RECENT_LOGS
+        BOT_KEY = key
+        BOT_IV = iv
+        BOT_TARGET_UID = int(TarGeT)
+        # note: BOT_READY will be set to True after the chat connection signals readiness below
+        RECENT_LOGS.append(f"Bot obtained credentials for target {BOT_TARGET_UID}")
+        if len(RECENT_LOGS) > 200:
+            RECENT_LOGS.pop(0)
+    except Exception:
+        pass
     
     LoGinDaTa = await GetLoginData(UrL , PyL , ToKen)
     if not LoGinDaTa: print("ErroR - GeTinG PorTs From LoGin DaTa !") ; return None
@@ -876,6 +896,11 @@ async def MaiiiinE():
     
     task1 = asyncio.create_task(TcPChaT(ChaTiP, ChaTporT , AutHToKen , key , iv , LoGinDaTaUncRypTinG , ready_event))
     await ready_event.wait()
+    # mark bot as ready for external requests
+    BOT_READY = True
+    RECENT_LOGS.append("Bot chat connection ready")
+    if len(RECENT_LOGS) > 200:
+        RECENT_LOGS.pop(0)
     await asyncio.sleep(1)
     task2 = asyncio.create_task(TcPOnLine(OnLineiP , OnLineporT , key , iv , AutHToKen))
     os.system('clear')
@@ -893,9 +918,262 @@ async def StarTinG():
         except Exception as e: 
             print(f"ErroR TcP - {e} => ResTarTinG ...")
 
+app = Flask(__name__)
+
+
+def parse_uids_param(uids_str):
+    if not uids_str:
+        return []
+    try:
+        parts = [p.strip() for p in uids_str.split(',') if p.strip()]
+        return [int(p) for p in parts]
+    except Exception:
+        return None
+
+
+def start_asyncio_loop_in_thread():
+    """Start the bot asyncio loop in a background thread and set global aio_loop."""
+    def _run_loop():
+        global aio_loop
+        aio_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(aio_loop)
+        # schedule the main bot starter
+        aio_loop.create_task(StarTinG())
+        try:
+            aio_loop.run_forever()
+        finally:
+            aio_loop.run_until_complete(aio_loop.shutdown_asyncgens())
+
+    t = Thread(target=_run_loop, daemon=True)
+    t.start()
+
+
+def schedule_coro_sync(coro, timeout=6):
+    """Schedule a coroutine on the bot event loop and wait for a short result.
+    Returns (success, result_or_error_message).
+    """
+    if not aio_loop:
+        return False, "Bot event loop not running"
+    try:
+        fut = asyncio.run_coroutine_threadsafe(coro, aio_loop)
+        return True, fut.result(timeout=timeout)
+    except Exception as e:
+        return False, str(e)
+
+
+# --- Async wrappers that run inside the bot event loop and create actual tasks ---
+async def _start_loop(target_uids, team_code):
+    global loop_active, loop_task, RECENT_LOGS
+    if loop_active:
+        return "already_running"
+    loop_active = True
+    loop_task = asyncio.create_task(loop_function(BOT_TARGET_UID, BOT_TARGET_UID, target_uids, team_code, BOT_KEY, BOT_IV))
+    RECENT_LOGS.append(f"Loop started for {target_uids} code={team_code}")
+    return "started"
+
+async def _start_evoloop(target_uids, team_code):
+    global evoloop_active, evoloop_task, RECENT_LOGS
+    if evoloop_active:
+        return "already_running"
+    evoloop_active = True
+    evoloop_task = asyncio.create_task(evoloop_function(BOT_TARGET_UID, BOT_TARGET_UID, target_uids, team_code, BOT_KEY, BOT_IV))
+    RECENT_LOGS.append(f"Evoloop started for {target_uids} code={team_code}")
+    return "started"
+
+async def _start_fun(target_uids, emote_id):
+    global RECENT_LOGS
+    asyncio.create_task(fun_function(BOT_TARGET_UID, BOT_TARGET_UID, target_uids, emote_id, BOT_KEY, BOT_IV))
+    RECENT_LOGS.append(f"Fun started for {target_uids} emote={emote_id}")
+    return "started"
+
+async def _start_proxy_private(team_code, uids, emote_id):
+    global RECENT_LOGS
+    asyncio.create_task(proxy_private_function(BOT_TARGET_UID, BOT_TARGET_UID, team_code, uids, emote_id, BOT_KEY, BOT_IV))
+    RECENT_LOGS.append(f"Proxy(private) started for {uids} emote={emote_id} code={team_code}")
+    return "started"
+
+async def _join_squad(team_code):
+    try:
+        pkt = await GenJoinSquadsPacket(team_code, BOT_KEY, BOT_IV)
+        await SEndPacKeT(online_writer, whisper_writer, 'OnLine', pkt)
+        RECENT_LOGS.append(f"Joined squad {team_code}")
+        return True
+    except Exception as e:
+        return str(e)
+
+async def _leave_squad():
+    try:
+        pkt = await ExiT(None, BOT_KEY, BOT_IV)
+        await SEndPacKeT(online_writer, whisper_writer, 'OnLine', pkt)
+        RECENT_LOGS.append("Left squad")
+        return True
+    except Exception as e:
+        return str(e)
+
+async def _stop_all():
+    global loop_active, evoloop_active, loop_task, evoloop_task, RECENT_LOGS
+    stopped = []
+    if loop_active and loop_task:
+        loop_active = False
+        try:
+            loop_task.cancel()
+        except Exception:
+            pass
+        loop_task = None
+        stopped.append("Loop")
+    if evoloop_active and evoloop_task:
+        evoloop_active = False
+        try:
+            evoloop_task.cancel()
+        except Exception:
+            pass
+        evoloop_task = None
+        stopped.append("Evolution Loop")
+    RECENT_LOGS.append(f"Stopped: {stopped}")
+    return stopped
+
+
+@app.route('/status')
+def status():
+    return jsonify({
+        "status": "ready" if BOT_READY else "starting",
+        "bot_ready": BOT_READY,
+        "loop_active": bool(loop_active),
+        "evoloop_active": bool(evoloop_active),
+        "target_uid": BOT_TARGET_UID
+    })
+
+
+@app.route('/loop')
+def http_loop():
+    uids = request.args.get('uids', '')
+    code = request.args.get('code')
+    parsed = parse_uids_param(uids)
+    if parsed is None or not parsed:
+        return jsonify({"status": "error", "message": "Invalid UIDs"}), 400
+    if not code:
+        return jsonify({"status": "error", "message": "Missing team code"}), 400
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_start_loop(parsed, code))
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    if res == "already_running":
+        return jsonify({"status": "error", "message": "Loop already running"}), 400
+    return jsonify({"status": "success", "message": "Loop started", "uids": parsed, "team_code": code})
+
+
+@app.route('/evoloop')
+def http_evoloop():
+    uids = request.args.get('uids', '')
+    code = request.args.get('code')
+    parsed = parse_uids_param(uids)
+    if parsed is None or not parsed:
+        return jsonify({"status": "error", "message": "Invalid UIDs"}), 400
+    if not code:
+        return jsonify({"status": "error", "message": "Missing team code"}), 400
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_start_evoloop(parsed, code))
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    if res == "already_running":
+        return jsonify({"status": "error", "message": "Evoloop already running"}), 400
+    return jsonify({"status": "success", "message": "Evoloop started", "uids": parsed, "team_code": code})
+
+
+@app.route('/fun')
+def http_fun():
+    uids = request.args.get('uids', '')
+    emote = request.args.get('emote')
+    parsed = parse_uids_param(uids)
+    try:
+        emote_id = int(emote)
+    except Exception:
+        return jsonify({"status": "error", "message": "Invalid emote id"}), 400
+    if parsed is None or not parsed:
+        return jsonify({"status": "error", "message": "Invalid UIDs"}), 400
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_start_fun(parsed, emote_id))
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    return jsonify({"status": "success", "message": "Fun started", "uids": parsed, "emote": emote_id})
+
+
+@app.route('/proxy')
+def http_proxy():
+    uids = request.args.get('uids', '')
+    emote = request.args.get('emote')
+    code = request.args.get('code')
+    parsed = parse_uids_param(uids)
+    try:
+        emote_id = int(emote)
+    except Exception:
+        return jsonify({"status": "error", "message": "Invalid emote id"}), 400
+    if parsed is None or not parsed:
+        return jsonify({"status": "error", "message": "Invalid UIDs"}), 400
+    if not code:
+        return jsonify({"status": "error", "message": "Missing team code"}), 400
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_start_proxy_private(code, parsed, emote_id))
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    return jsonify({"status": "success", "message": "Proxy started", "uids": parsed, "emote": emote_id, "team_code": code})
+
+
+@app.route('/join')
+def http_join():
+    tc = request.args.get('tc')
+    if not tc:
+        return jsonify({"status": "error", "message": "Missing team code (tc)"}), 400
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_join_squad(tc))
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    if res is True:
+        return jsonify({"status": "success", "message": f"Joined squad {tc}", "team_code": tc})
+    return jsonify({"status": "error", "message": str(res)}), 500
+
+
+@app.route('/leave')
+def http_leave():
+    if not BOT_READY:
+        return jsonify({"status": "error", "message": "Bot not ready"}), 503
+    ok, res = schedule_coro_sync(_leave_squad())
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    if res is True:
+        return jsonify({"status": "success", "message": "Left squad"})
+    return jsonify({"status": "error", "message": str(res)}), 500
+
+
+@app.route('/stop')
+def http_stop():
+    ok, res = schedule_coro_sync(_stop_all())
+    if not ok:
+        return jsonify({"status": "error", "message": res}), 500
+    return jsonify({"status": "success", "message": "Stopped processes", "stopped": res})
+
+
+@app.route('/log')
+def http_log():
+    # return recent logs (last 100)
+    return jsonify({"logs": RECENT_LOGS[-100:]})
+
+
 if __name__ == '__main__':
-    get_emote_from_file(1) 
+    # seed files
+    get_emote_from_file(1)
     get_evo_from_file(1)
     get_random_loop_item()
     get_random_evoloop_item()
-    asyncio.run(StarTinG())
+
+    # start bot asyncio loop in background
+    start_asyncio_loop_in_thread()
+
+    # start flask in main thread
+    print("Starting Flask API on http://127.0.0.1:5000")
+    app.run(host='127.0.0.1', port=5000)
